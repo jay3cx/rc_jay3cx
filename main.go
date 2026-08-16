@@ -16,7 +16,10 @@ type config struct {
 	Addr           string
 	DBPath         string
 	WorkerCount    int
+	MaxAttempts    int
 	PollInterval   time.Duration
+	BaseBackoff    time.Duration
+	MaxBackoff     time.Duration
 	LeaseDuration  time.Duration
 	RequestTimeout time.Duration
 }
@@ -26,7 +29,10 @@ func defaultConfig() config {
 		Addr:           "127.0.0.1:8080",
 		DBPath:         "notifyd.db",
 		WorkerCount:    8,
+		MaxAttempts:    12,
 		PollInterval:   250 * time.Millisecond,
+		BaseBackoff:    5 * time.Second,
+		MaxBackoff:     15 * time.Minute,
 		LeaseDuration:  30 * time.Second,
 		RequestTimeout: 10 * time.Second,
 	}

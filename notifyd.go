@@ -10,6 +10,7 @@ import (
 	"errors"
 	"io"
 	"log"
+	mathrand "math/rand"
 	"net/http"
 	"net/url"
 	"strings"
@@ -31,10 +32,10 @@ type service struct {
 }
 
 func newService(cfg config) (*service, error) {
-	if cfg.DBPath == "" || cfg.WorkerCount < 1 {
+	if cfg.DBPath == "" || cfg.WorkerCount < 1 || cfg.MaxAttempts < 1 {
 		return nil, errors.New("invalid service configuration")
 	}
-	if cfg.PollInterval <= 0 || cfg.LeaseDuration <= 0 || cfg.RequestTimeout <= 0 {
+	if cfg.PollInterval <= 0 || cfg.BaseBackoff <= 0 || cfg.MaxBackoff < cfg.BaseBackoff || cfg.LeaseDuration <= 0 || cfg.RequestTimeout <= 0 {
 		return nil, errors.New("invalid service timing configuration")
 	}
 
@@ -61,8 +62,10 @@ func newService(cfg config) (*service, error) {
 			target_url TEXT NOT NULL,
 			headers BLOB NOT NULL,
 			body BLOB NOT NULL,
-			status TEXT NOT NULL CHECK (status IN ('pending', 'delivering', 'succeeded', 'dead')),
+			status TEXT NOT NULL CHECK (status IN ('pending', 'delivering', 'retrying', 'succeeded', 'dead')),
 			attempt_count INTEGER NOT NULL DEFAULT 0,
+			run_attempts INTEGER NOT NULL DEFAULT 0,
+			max_attempts INTEGER NOT NULL,
 			next_attempt_at INTEGER NOT NULL,
 			lease_until INTEGER,
 			lease_token TEXT,
@@ -124,6 +127,7 @@ func (s *service) handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /v1/notifications", s.createNotification)
 	mux.HandleFunc("GET /v1/notifications/{id}", s.getNotification)
+	mux.HandleFunc("POST /v1/notifications/{id}/replay", s.replayNotification)
 	mux.HandleFunc("GET /healthz", s.health)
 	return mux
 }
@@ -179,9 +183,10 @@ func (s *service) createNotification(w http.ResponseWriter, r *http.Request) {
 	now := time.Now().UTC().UnixMilli()
 	_, err = s.db.ExecContext(r.Context(), `
 		INSERT INTO notifications (
-			id, method, target_url, headers, body, status, next_attempt_at, created_at, updated_at
-		) VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?)`,
-		id, method, target.String(), headerBytes, []byte(input.Body), now, now, now)
+			id, method, target_url, headers, body, status, max_attempts,
+			next_attempt_at, created_at, updated_at
+		) VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?)`,
+		id, method, target.String(), headerBytes, []byte(input.Body), s.cfg.MaxAttempts, now, now, now)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "storage_error", "notification could not be stored")
 		return
@@ -271,6 +276,40 @@ func (s *service) getNotification(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, response)
 }
 
+func (s *service) replayNotification(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	now := time.Now().UTC().UnixMilli()
+	result, err := s.db.ExecContext(r.Context(), `
+		UPDATE notifications
+		SET status = 'pending', run_attempts = 0, next_attempt_at = ?, lease_until = NULL,
+			lease_token = NULL, last_status = NULL, last_error = NULL, updated_at = ?
+		WHERE id = ? AND status = 'dead'`, now, now, id)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "storage_error", "notification could not be replayed")
+		return
+	}
+	updated, err := result.RowsAffected()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "storage_error", "notification could not be replayed")
+		return
+	}
+	if updated == 0 {
+		var status string
+		err := s.db.QueryRowContext(r.Context(), `SELECT status FROM notifications WHERE id = ?`, id).Scan(&status)
+		if errors.Is(err, sql.ErrNoRows) {
+			writeError(w, http.StatusNotFound, "not_found", "notification was not found")
+			return
+		}
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "storage_error", "notification could not be read")
+			return
+		}
+		writeError(w, http.StatusConflict, "not_dead", "only dead notifications can be replayed")
+		return
+	}
+	writeJSON(w, http.StatusAccepted, map[string]string{"id": id, "status": "pending"})
+}
+
 func (s *service) health(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), time.Second)
 	defer cancel()
@@ -305,12 +344,13 @@ func (s *service) work() {
 }
 
 type deliveryTask struct {
-	id         string
-	leaseToken string
-	method     string
-	targetURL  string
-	headers    []byte
-	body       []byte
+	id          string
+	leaseToken  string
+	method      string
+	targetURL   string
+	headers     []byte
+	body        []byte
+	maxAttempts int
 }
 
 func (s *service) claim(ctx context.Context) (deliveryTask, error) {
@@ -326,20 +366,20 @@ func (s *service) claim(ctx context.Context) (deliveryTask, error) {
 		SET status = 'delivering', lease_until = ?, lease_token = ?, updated_at = ?
 		WHERE id = (
 			SELECT id FROM notifications
-			WHERE (status = 'pending' AND next_attempt_at <= ?)
+			WHERE (status IN ('pending', 'retrying') AND next_attempt_at <= ?)
 				OR (status = 'delivering' AND lease_until <= ?)
 			ORDER BY CASE WHEN status = 'delivering' THEN lease_until ELSE next_attempt_at END, created_at
 			LIMIT 1
 		)
-		RETURNING id, method, target_url, headers, body`,
+		RETURNING id, method, target_url, headers, body, max_attempts`,
 		leaseUntil, leaseToken, now.UnixMilli(), now.UnixMilli(), now.UnixMilli(),
-	).Scan(&task.id, &task.method, &task.targetURL, &task.headers, &task.body)
+	).Scan(&task.id, &task.method, &task.targetURL, &task.headers, &task.body, &task.maxAttempts)
 	task.leaseToken = leaseToken
 	return task, err
 }
 
 func (s *service) process(task deliveryTask) {
-	attemptID, attemptNumber, err := s.beginAttempt(task)
+	attemptID, attemptNumber, runAttempts, err := s.beginAttempt(task)
 	if err != nil {
 		if !errors.Is(err, errLeaseLost) && !errors.Is(err, context.Canceled) {
 			log.Printf("begin delivery notification_id=%s: %v", task.id, err)
@@ -350,7 +390,7 @@ func (s *service) process(task deliveryTask) {
 	if result.aborted {
 		return
 	}
-	state, updated, err := s.finishAttempt(task, attemptID, result)
+	state, updated, err := s.finishAttempt(task, attemptID, runAttempts, result)
 	if err != nil {
 		log.Printf("finish delivery notification_id=%s: %v", task.id, err)
 		return
@@ -362,45 +402,46 @@ func (s *service) process(task deliveryTask) {
 
 var errLeaseLost = errors.New("notification lease was lost")
 
-func (s *service) beginAttempt(task deliveryTask) (int64, int, error) {
+func (s *service) beginAttempt(task deliveryTask) (int64, int, int, error) {
 	tx, err := s.db.BeginTx(s.ctx, nil)
 	if err != nil {
-		return 0, 0, err
+		return 0, 0, 0, err
 	}
 	defer tx.Rollback()
-	var attemptNumber int
+	var attemptNumber, runAttempts int
 	err = tx.QueryRowContext(s.ctx, `
 		UPDATE notifications
-		SET attempt_count = attempt_count + 1, updated_at = ?
+		SET attempt_count = attempt_count + 1, run_attempts = run_attempts + 1, updated_at = ?
 		WHERE id = ? AND status = 'delivering' AND lease_token = ?
-		RETURNING attempt_count`,
+		RETURNING attempt_count, run_attempts`,
 		time.Now().UTC().UnixMilli(), task.id, task.leaseToken,
-	).Scan(&attemptNumber)
+	).Scan(&attemptNumber, &runAttempts)
 	if errors.Is(err, sql.ErrNoRows) {
-		return 0, 0, errLeaseLost
+		return 0, 0, 0, errLeaseLost
 	}
 	if err != nil {
-		return 0, 0, err
+		return 0, 0, 0, err
 	}
 	result, err := tx.ExecContext(s.ctx, `
 		INSERT INTO delivery_attempts (notification_id, number, started_at, outcome)
 		VALUES (?, ?, ?, 'in_progress')`, task.id, attemptNumber, time.Now().UTC().UnixMilli())
 	if err != nil {
-		return 0, 0, err
+		return 0, 0, 0, err
 	}
 	attemptID, err := result.LastInsertId()
 	if err != nil {
-		return 0, 0, err
+		return 0, 0, 0, err
 	}
 	if err := tx.Commit(); err != nil {
-		return 0, 0, err
+		return 0, 0, 0, err
 	}
-	return attemptID, attemptNumber, nil
+	return attemptID, attemptNumber, runAttempts, nil
 }
 
 type deliveryResult struct {
 	outcome    string
 	statusCode *int
+	retryable  bool
 	succeeded  bool
 	aborted    bool
 }
@@ -425,24 +466,41 @@ func (s *service) send(task deliveryTask) deliveryResult {
 		if s.ctx.Err() != nil {
 			return deliveryResult{aborted: true}
 		}
-		return deliveryResult{outcome: "network_error"}
+		if errors.Is(err, context.DeadlineExceeded) {
+			return deliveryResult{outcome: "timeout", retryable: true}
+		}
+		return deliveryResult{outcome: "network_error", retryable: true}
 	}
 	_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, 32<<10))
 	response.Body.Close()
 	statusCode := response.StatusCode
-	if statusCode >= 200 && statusCode < 300 {
-		return deliveryResult{outcome: "succeeded", statusCode: &statusCode, succeeded: true}
+	result := deliveryResult{statusCode: &statusCode}
+	switch {
+	case statusCode >= 200 && statusCode < 300:
+		result.outcome = "succeeded"
+		result.succeeded = true
+	case statusCode == http.StatusRequestTimeout || statusCode == http.StatusTooManyRequests || statusCode >= 500:
+		result.outcome = "retryable_status"
+		result.retryable = true
+	case statusCode >= 400 && statusCode < 500:
+		result.outcome = "client_error"
+	default:
+		result.outcome = "unexpected_status"
 	}
-	return deliveryResult{outcome: "http_error", statusCode: &statusCode}
+	return result
 }
 
-func (s *service) finishAttempt(task deliveryTask, attemptID int64, delivery deliveryResult) (string, bool, error) {
+func (s *service) finishAttempt(task deliveryTask, attemptID int64, runAttempts int, delivery deliveryResult) (string, bool, error) {
 	now := time.Now().UTC()
 	state := "dead"
+	nextAttemptAt := now.UnixMilli()
 	var lastError any = delivery.outcome
 	if delivery.succeeded {
 		state = "succeeded"
 		lastError = nil
+	} else if delivery.retryable && runAttempts < task.maxAttempts {
+		state = "retrying"
+		nextAttemptAt = now.Add(s.backoff(runAttempts)).UnixMilli()
 	}
 	var statusCode any
 	if delivery.statusCode != nil {
@@ -462,10 +520,10 @@ func (s *service) finishAttempt(task deliveryTask, attemptID int64, delivery del
 	}
 	result, err := tx.ExecContext(s.ctx, `
 		UPDATE notifications
-		SET status = ?, lease_until = NULL, lease_token = NULL,
+		SET status = ?, next_attempt_at = ?, lease_until = NULL, lease_token = NULL,
 			last_status = ?, last_error = ?, updated_at = ?
 		WHERE id = ? AND status = 'delivering' AND lease_token = ?`,
-		state, statusCode, lastError, now.UnixMilli(), task.id, task.leaseToken)
+		state, nextAttemptAt, statusCode, lastError, now.UnixMilli(), task.id, task.leaseToken)
 	if err != nil {
 		return "", false, err
 	}
@@ -477,6 +535,25 @@ func (s *service) finishAttempt(task deliveryTask, attemptID int64, delivery del
 		return "", false, err
 	}
 	return state, updated == 1, nil
+}
+
+func (s *service) backoff(attempt int) time.Duration {
+	delay := s.cfg.BaseBackoff
+	for i := 1; i < attempt && delay < s.cfg.MaxBackoff; i++ {
+		if delay > s.cfg.MaxBackoff/2 {
+			delay = s.cfg.MaxBackoff
+			break
+		}
+		delay *= 2
+	}
+	if delay > s.cfg.MaxBackoff {
+		delay = s.cfg.MaxBackoff
+	}
+	half := delay / 2
+	if delay-half <= 0 {
+		return delay
+	}
+	return half + time.Duration(mathrand.Int63n(int64(delay-half)+1))
 }
 
 func parseTarget(raw string) (*url.URL, error) {
