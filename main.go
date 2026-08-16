@@ -13,14 +13,22 @@ import (
 )
 
 type config struct {
-	Addr   string
-	DBPath string
+	Addr           string
+	DBPath         string
+	WorkerCount    int
+	PollInterval   time.Duration
+	LeaseDuration  time.Duration
+	RequestTimeout time.Duration
 }
 
 func defaultConfig() config {
 	return config{
-		Addr:   "127.0.0.1:8080",
-		DBPath: "notifyd.db",
+		Addr:           "127.0.0.1:8080",
+		DBPath:         "notifyd.db",
+		WorkerCount:    8,
+		PollInterval:   250 * time.Millisecond,
+		LeaseDuration:  30 * time.Second,
+		RequestTimeout: 10 * time.Second,
 	}
 }
 
@@ -48,6 +56,7 @@ func run() error {
 		return fmt.Errorf("start notifyd: %w", err)
 	}
 	defer service.close()
+	service.start()
 
 	server := &http.Server{
 		Addr:              cfg.Addr,
