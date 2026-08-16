@@ -1,0 +1,21 @@
+services:
+  notifyd:
+    image: rc_jay3cx:local
+    build: .
+    environment:
+      NOTIFYD_ADDR: ":8080"
+      NOTIFYD_DB_PATH: /data/notifyd.db
+      NOTIFYD_ALLOW_PRIVATE_NETWORKS: "true"
+    ports:
+      - "8080:8080"
+    volumes:
+      - notifyd-data:/data
+    depends_on:
+      - mockvendor
+
+  mockvendor:
+    image: rc_jay3cx:local
+    entrypoint: ["/usr/local/bin/mockvendor"]
+
+volumes:
+  notifyd-data:

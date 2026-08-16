@@ -281,6 +281,7 @@ func (s *service) createNotification(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "storage_error", "notification could not be stored")
 		return
 	}
+	status := "pending"
 	if inserted == 0 {
 		existing, err = s.findByIdempotencyKey(r.Context(), key)
 		if err != nil {
@@ -292,8 +293,9 @@ func (s *service) createNotification(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		id = existing.id
+		status = existing.status
 	}
-	writeJSON(w, http.StatusAccepted, map[string]string{"id": id, "status": "pending"})
+	writeJSON(w, http.StatusAccepted, map[string]string{"id": id, "status": status})
 }
 
 type idempotentNotification struct {

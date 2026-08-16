@@ -118,6 +118,11 @@ func TestNotificationLifecycle(t *testing.T) {
 		if first.code != http.StatusAccepted || second.code != http.StatusAccepted || first.id != second.id {
 			t.Fatalf("same request was not deduplicated: first=%+v second=%+v", first, second)
 		}
+		waitForStatus(t, api.URL, first.id, "succeeded")
+		replay := submitNotification(t, api.URL, "same-key", vendor.URL+"/ok", `{"contact_id":"c-4"}`)
+		if replay.code != http.StatusAccepted || replay.id != first.id || replay.status != "succeeded" {
+			t.Fatalf("duplicate after success = %+v, want succeeded %s", replay, first.id)
+		}
 
 		conflict := submitNotification(t, api.URL, "same-key", vendor.URL+"/ok", `{"contact_id":"changed"}`)
 		if conflict.code != http.StatusConflict {
@@ -146,6 +151,7 @@ func TestNotificationLifecycle(t *testing.T) {
 type submitResult struct {
 	code      int
 	id        string
+	status    string
 	body      string
 	errorCode string
 }
@@ -169,15 +175,16 @@ func submitNotification(t *testing.T, apiURL, key, targetURL, body string) submi
 		t.Fatalf("read enqueue response: %v", err)
 	}
 	var decoded struct {
-		ID    string `json:"id"`
-		Error struct {
+		ID     string `json:"id"`
+		Status string `json:"status"`
+		Error  struct {
 			Code string `json:"code"`
 		} `json:"error"`
 	}
 	if err := json.Unmarshal(responseBody, &decoded); err != nil {
 		t.Fatalf("decode enqueue response %q: %v", responseBody, err)
 	}
-	return submitResult{resp.StatusCode, decoded.ID, string(responseBody), decoded.Error.Code}
+	return submitResult{resp.StatusCode, decoded.ID, decoded.Status, string(responseBody), decoded.Error.Code}
 }
 
 type notificationView struct {
