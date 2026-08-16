@@ -4,14 +4,18 @@ import (
 	"bytes"
 	"context"
 	cryptorand "crypto/rand"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	mathrand "math/rand"
+	"net"
 	"net/http"
+	"net/textproto"
 	"net/url"
 	"strings"
 	"sync"
@@ -20,10 +24,15 @@ import (
 	_ "modernc.org/sqlite"
 )
 
+const maxCreateRequestBytes = 1 << 20
+
 type service struct {
 	cfg       config
 	db        *sql.DB
+	resolver  *net.Resolver
+	transport *http.Transport
 	client    *http.Client
+	limiter   *hostLimiter
 	ctx       context.Context
 	cancel    context.CancelFunc
 	workers   sync.WaitGroup
@@ -32,7 +41,7 @@ type service struct {
 }
 
 func newService(cfg config) (*service, error) {
-	if cfg.DBPath == "" || cfg.WorkerCount < 1 || cfg.MaxAttempts < 1 {
+	if cfg.DBPath == "" || cfg.WorkerCount < 1 || cfg.PerHostConcurrency < 1 || cfg.MaxAttempts < 1 {
 		return nil, errors.New("invalid service configuration")
 	}
 	if cfg.PollInterval <= 0 || cfg.BaseBackoff <= 0 || cfg.MaxBackoff < cfg.BaseBackoff || cfg.LeaseDuration <= 0 || cfg.RequestTimeout <= 0 {
@@ -58,6 +67,8 @@ func newService(cfg config) (*service, error) {
 	for _, statement := range []string{
 		`CREATE TABLE IF NOT EXISTS notifications (
 			id TEXT PRIMARY KEY,
+			idempotency_key TEXT NOT NULL UNIQUE,
+			request_hash BLOB NOT NULL,
 			method TEXT NOT NULL,
 			target_url TEXT NOT NULL,
 			headers BLOB NOT NULL,
@@ -95,13 +106,36 @@ func newService(cfg config) (*service, error) {
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
-	return &service{
-		cfg:    cfg,
-		db:     db,
-		client: &http.Client{Timeout: cfg.RequestTimeout},
-		ctx:    ctx,
-		cancel: cancel,
-	}, nil
+	s := &service{
+		cfg:      cfg,
+		db:       db,
+		resolver: net.DefaultResolver,
+		limiter:  newHostLimiter(cfg.PerHostConcurrency),
+		ctx:      ctx,
+		cancel:   cancel,
+	}
+	dialer := &net.Dialer{Timeout: cfg.RequestTimeout, KeepAlive: 30 * time.Second}
+	s.transport = &http.Transport{
+		Proxy:                 nil,
+		DialContext:           s.dialContext(dialer),
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          cfg.WorkerCount * 2,
+		MaxIdleConnsPerHost:   cfg.PerHostConcurrency,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   cfg.RequestTimeout,
+		ResponseHeaderTimeout: cfg.RequestTimeout,
+	}
+	s.client = &http.Client{
+		Transport: s.transport,
+		Timeout:   cfg.RequestTimeout,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if len(via) >= 5 {
+				return errors.New("redirect limit reached")
+			}
+			return s.validateTarget(req.Context(), req.URL)
+		},
+	}
+	return s, nil
 }
 
 func (s *service) start() {
@@ -117,6 +151,7 @@ func (s *service) close() {
 	s.closeOnce.Do(func() {
 		s.cancel()
 		s.workers.Wait()
+		s.transport.CloseIdleConnections()
 		if err := s.db.Close(); err != nil {
 			log.Printf("close database: %v", err)
 		}
@@ -140,6 +175,12 @@ type notificationRequest struct {
 }
 
 func (s *service) createNotification(w http.ResponseWriter, r *http.Request) {
+	key := strings.TrimSpace(r.Header.Get("Idempotency-Key"))
+	if key == "" || len(key) > 200 {
+		writeError(w, http.StatusBadRequest, "invalid_idempotency_key", "Idempotency-Key is required and must be at most 200 bytes")
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, maxCreateRequestBytes)
 	decoder := json.NewDecoder(r.Body)
 	decoder.DisallowUnknownFields()
 	var input notificationRequest
@@ -164,16 +205,58 @@ func (s *service) createNotification(w http.ResponseWriter, r *http.Request) {
 	}
 	target, err := parseTarget(input.URL)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_target", "url must be an absolute HTTP(S) URL")
+		writeError(w, http.StatusBadRequest, "invalid_target", "url must be an absolute HTTP(S) URL without credentials or a fragment")
 		return
 	}
-	headerBytes, err := json.Marshal(input.Headers)
+	headers, err := canonicalHeaders(input.Headers)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_headers", err.Error())
+		return
+	}
+	input.URL = target.String()
+	input.Method = method
+	input.Headers = headers
+	if input.Body == nil {
+		input.Body = json.RawMessage{}
+	}
+	hashInput, err := json.Marshal(input)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_request", "request could not be encoded")
+		return
+	}
+	requestHash := sha256.Sum256(hashInput)
+
+	existing, err := s.findByIdempotencyKey(r.Context(), key)
+	if err == nil {
+		if !bytes.Equal(existing.hash, requestHash[:]) {
+			writeError(w, http.StatusConflict, "idempotency_conflict", "Idempotency-Key was already used for a different request")
+			return
+		}
+		writeJSON(w, http.StatusAccepted, map[string]string{"id": existing.id, "status": existing.status})
+		return
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		writeError(w, http.StatusInternalServerError, "storage_error", "notification could not be stored")
+		return
+	}
+
+	validationCtx, cancel := context.WithTimeout(r.Context(), s.cfg.RequestTimeout)
+	err = s.validateTarget(validationCtx, target)
+	cancel()
+	if err != nil {
+		var targetErr *targetError
+		if errors.As(err, &targetErr) {
+			writeError(w, http.StatusBadRequest, targetErr.code, targetErr.publicMessage)
+			return
+		}
+		writeError(w, http.StatusBadRequest, "invalid_target", "target host could not be validated")
+		return
+	}
+
+	headerBytes, err := json.Marshal(headers)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_headers", "headers could not be encoded")
 		return
-	}
-	if input.Body == nil {
-		input.Body = json.RawMessage{}
 	}
 	id, err := randomID()
 	if err != nil {
@@ -181,17 +264,50 @@ func (s *service) createNotification(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	now := time.Now().UTC().UnixMilli()
-	_, err = s.db.ExecContext(r.Context(), `
+	result, err := s.db.ExecContext(r.Context(), `
 		INSERT INTO notifications (
-			id, method, target_url, headers, body, status, max_attempts,
-			next_attempt_at, created_at, updated_at
-		) VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?)`,
-		id, method, target.String(), headerBytes, []byte(input.Body), s.cfg.MaxAttempts, now, now, now)
+			id, idempotency_key, request_hash, method, target_url, headers, body,
+			status, max_attempts, next_attempt_at, created_at, updated_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?)
+		ON CONFLICT(idempotency_key) DO NOTHING`,
+		id, key, requestHash[:], method, target.String(), headerBytes, []byte(input.Body),
+		s.cfg.MaxAttempts, now, now, now)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "storage_error", "notification could not be stored")
 		return
 	}
+	inserted, err := result.RowsAffected()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "storage_error", "notification could not be stored")
+		return
+	}
+	if inserted == 0 {
+		existing, err = s.findByIdempotencyKey(r.Context(), key)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "storage_error", "notification could not be stored")
+			return
+		}
+		if !bytes.Equal(existing.hash, requestHash[:]) {
+			writeError(w, http.StatusConflict, "idempotency_conflict", "Idempotency-Key was already used for a different request")
+			return
+		}
+		id = existing.id
+	}
 	writeJSON(w, http.StatusAccepted, map[string]string{"id": id, "status": "pending"})
+}
+
+type idempotentNotification struct {
+	id     string
+	status string
+	hash   []byte
+}
+
+func (s *service) findByIdempotencyKey(ctx context.Context, key string) (idempotentNotification, error) {
+	var notification idempotentNotification
+	err := s.db.QueryRowContext(ctx,
+		`SELECT id, status, request_hash FROM notifications WHERE idempotency_key = ?`, key,
+	).Scan(&notification.id, &notification.status, &notification.hash)
+	return notification, err
 }
 
 type notificationResponse struct {
@@ -379,6 +495,28 @@ func (s *service) claim(ctx context.Context) (deliveryTask, error) {
 }
 
 func (s *service) process(task deliveryTask) {
+	done := make(chan struct{})
+	var leaseWorker sync.WaitGroup
+	leaseWorker.Add(1)
+	go func() {
+		defer leaseWorker.Done()
+		s.renewLease(task, done)
+	}()
+	defer func() {
+		close(done)
+		leaseWorker.Wait()
+	}()
+
+	target, err := url.Parse(task.targetURL)
+	if err != nil {
+		return
+	}
+	release, err := s.limiter.acquire(s.ctx, strings.ToLower(target.Hostname()))
+	if err != nil {
+		return
+	}
+	defer release()
+
 	attemptID, attemptNumber, runAttempts, err := s.beginAttempt(task)
 	if err != nil {
 		if !errors.Is(err, errLeaseLost) && !errors.Is(err, context.Canceled) {
@@ -396,7 +534,37 @@ func (s *service) process(task deliveryTask) {
 		return
 	}
 	if updated {
-		log.Printf("notification_id=%s target=%s attempt=%d outcome=%s state=%s", task.id, task.targetURL, attemptNumber, result.outcome, state)
+		log.Printf("notification_id=%s attempt=%d outcome=%s state=%s", task.id, attemptNumber, result.outcome, state)
+	}
+}
+
+func (s *service) renewLease(task deliveryTask, done <-chan struct{}) {
+	interval := s.cfg.LeaseDuration / 3
+	if interval < 10*time.Millisecond {
+		interval = 10 * time.Millisecond
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-done:
+			return
+		case <-s.ctx.Done():
+			return
+		case now := <-ticker.C:
+			result, err := s.db.ExecContext(s.ctx, `
+				UPDATE notifications SET lease_until = ?, updated_at = ?
+				WHERE id = ? AND status = 'delivering' AND lease_token = ?`,
+				now.Add(s.cfg.LeaseDuration).UnixMilli(), now.UnixMilli(), task.id, task.leaseToken)
+			if err != nil {
+				log.Printf("renew lease notification_id=%s: %v", task.id, err)
+				continue
+			}
+			updated, err := result.RowsAffected()
+			if err != nil || updated == 0 {
+				return
+			}
+		}
 	}
 }
 
@@ -450,6 +618,17 @@ func (s *service) send(task deliveryTask) deliveryResult {
 	if s.ctx.Err() != nil {
 		return deliveryResult{aborted: true}
 	}
+	target, err := url.Parse(task.targetURL)
+	if err != nil {
+		return deliveryResult{outcome: "invalid_request"}
+	}
+	if err := s.validateTarget(s.ctx, target); err != nil {
+		var targetErr *targetError
+		if errors.As(err, &targetErr) && targetErr.code == "target_blocked" {
+			return deliveryResult{outcome: "target_blocked"}
+		}
+		return deliveryResult{outcome: "network_error", retryable: true}
+	}
 	var headers map[string]string
 	if err := json.Unmarshal(task.headers, &headers); err != nil {
 		return deliveryResult{outcome: "invalid_request"}
@@ -465,6 +644,10 @@ func (s *service) send(task deliveryTask) deliveryResult {
 	if err != nil {
 		if s.ctx.Err() != nil {
 			return deliveryResult{aborted: true}
+		}
+		var targetErr *targetError
+		if errors.As(err, &targetErr) && targetErr.code == "target_blocked" {
+			return deliveryResult{outcome: "target_blocked"}
 		}
 		if errors.Is(err, context.DeadlineExceeded) {
 			return deliveryResult{outcome: "timeout", retryable: true}
@@ -556,6 +739,15 @@ func (s *service) backoff(attempt int) time.Duration {
 	return half + time.Duration(mathrand.Int63n(int64(delay-half)+1))
 }
 
+type targetError struct {
+	code          string
+	publicMessage string
+}
+
+func (e *targetError) Error() string {
+	return e.code
+}
+
 func parseTarget(raw string) (*url.URL, error) {
 	target, err := url.Parse(strings.TrimSpace(raw))
 	if err != nil || target.Hostname() == "" || target.User != nil || target.Fragment != "" || target.Opaque != "" {
@@ -566,6 +758,151 @@ func parseTarget(raw string) (*url.URL, error) {
 		return nil, errors.New("invalid target")
 	}
 	return target, nil
+}
+
+func (s *service) validateTarget(ctx context.Context, target *url.URL) error {
+	if target == nil || (target.Scheme != "http" && target.Scheme != "https") || target.Hostname() == "" || target.User != nil {
+		return &targetError{code: "invalid_target", publicMessage: "target must be an absolute HTTP(S) URL"}
+	}
+	_, err := s.allowedIPs(ctx, target.Hostname())
+	return err
+}
+
+func (s *service) allowedIPs(ctx context.Context, host string) ([]net.IP, error) {
+	var addresses []net.IP
+	if parsed := net.ParseIP(host); parsed != nil {
+		addresses = []net.IP{parsed}
+	} else {
+		resolved, err := s.resolver.LookupIPAddr(ctx, host)
+		if err != nil || len(resolved) == 0 {
+			return nil, &targetError{code: "invalid_target", publicMessage: "target host could not be resolved"}
+		}
+		addresses = make([]net.IP, 0, len(resolved))
+		for _, address := range resolved {
+			addresses = append(addresses, address.IP)
+		}
+	}
+	for _, address := range addresses {
+		if s.blockedIP(address) {
+			return nil, &targetError{code: "target_blocked", publicMessage: "target resolves to a blocked network"}
+		}
+	}
+	return addresses, nil
+}
+
+func (s *service) blockedIP(address net.IP) bool {
+	for _, metadataAddress := range metadataAddresses {
+		if address.Equal(metadataAddress) {
+			return true
+		}
+	}
+	if address.IsLinkLocalUnicast() || address.IsLinkLocalMulticast() || address.IsUnspecified() || address.IsMulticast() {
+		return true
+	}
+	if address.IsLoopback() || address.IsPrivate() {
+		return !s.cfg.AllowPrivateNetworks
+	}
+	return !address.IsGlobalUnicast()
+}
+
+var metadataAddresses = []net.IP{
+	net.ParseIP("169.254.169.254"),
+	net.ParseIP("100.100.100.200"),
+	net.ParseIP("fd00:ec2::254"),
+}
+
+func (s *service) dialContext(dialer *net.Dialer) func(context.Context, string, string) (net.Conn, error) {
+	return func(ctx context.Context, network, address string) (net.Conn, error) {
+		host, port, err := net.SplitHostPort(address)
+		if err != nil {
+			return nil, &targetError{code: "invalid_target", publicMessage: "target address is invalid"}
+		}
+		addresses, err := s.allowedIPs(ctx, host)
+		if err != nil {
+			return nil, err
+		}
+		var lastErr error
+		for _, ip := range addresses {
+			connection, err := dialer.DialContext(ctx, network, net.JoinHostPort(ip.String(), port))
+			if err == nil {
+				return connection, nil
+			}
+			lastErr = err
+		}
+		if lastErr == nil {
+			lastErr = errors.New("target has no usable address")
+		}
+		return nil, fmt.Errorf("connect target: %w", lastErr)
+	}
+}
+
+func canonicalHeaders(input map[string]string) (map[string]string, error) {
+	result := make(map[string]string, len(input))
+	blocked := map[string]bool{
+		"Connection": true, "Content-Length": true, "Host": true, "Keep-Alive": true,
+		"Proxy-Authenticate": true, "Proxy-Authorization": true, "Te": true,
+		"Trailer": true, "Transfer-Encoding": true, "Upgrade": true,
+	}
+	for name, value := range input {
+		canonical := textproto.CanonicalMIMEHeaderKey(name)
+		if canonical == "" || strings.ContainsAny(value, "\r\n") {
+			return nil, errors.New("headers contain an invalid name or value")
+		}
+		if blocked[canonical] {
+			return nil, fmt.Errorf("header %s is not allowed", canonical)
+		}
+		if _, exists := result[canonical]; exists {
+			return nil, fmt.Errorf("header %s is duplicated", canonical)
+		}
+		result[canonical] = value
+	}
+	return result, nil
+}
+
+type hostLimiter struct {
+	limit int
+	mu    sync.Mutex
+	hosts map[string]*hostGate
+}
+
+type hostGate struct {
+	semaphore  chan struct{}
+	references int
+}
+
+func newHostLimiter(limit int) *hostLimiter {
+	return &hostLimiter{limit: limit, hosts: make(map[string]*hostGate)}
+}
+
+func (l *hostLimiter) acquire(ctx context.Context, host string) (func(), error) {
+	l.mu.Lock()
+	gate := l.hosts[host]
+	if gate == nil {
+		gate = &hostGate{semaphore: make(chan struct{}, l.limit)}
+		l.hosts[host] = gate
+	}
+	gate.references++
+	l.mu.Unlock()
+
+	select {
+	case gate.semaphore <- struct{}{}:
+		return func() {
+			<-gate.semaphore
+			l.releaseReference(host, gate)
+		}, nil
+	case <-ctx.Done():
+		l.releaseReference(host, gate)
+		return nil, ctx.Err()
+	}
+}
+
+func (l *hostLimiter) releaseReference(host string, gate *hostGate) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	gate.references--
+	if gate.references == 0 && l.hosts[host] == gate {
+		delete(l.hosts, host)
+	}
 }
 
 func randomID() (string, error) {
